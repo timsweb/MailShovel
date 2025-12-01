@@ -1,0 +1,27 @@
+# Git files
+.git
+.gitignore
+
+# Docker files
+Dockerfile
+.dockerignore
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE and environment files
+.idea/
+.vscode/
+*.env
+
+# Configuration and state files are mounted, not copied
+config/
+
+# Local virtual environment
+/lib
+/bin
+/include
+pyvenv.cfg

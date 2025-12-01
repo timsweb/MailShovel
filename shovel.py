@@ -1,7 +1,7 @@
 import json
 import imapclient
 import base64
-import os.path
+import os
 import argparse
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -11,40 +11,47 @@ from googleapiclient.discovery import build
 # This scope allows the script to insert messages AND create/manage labels.
 SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
 
-# --- Label Cache Setup ---
-LABEL_CACHE_FILE = 'label_cache.json'
+# --- Paths Setup ---
+# All configuration and state files are expected to be in a 'config' directory.
+CONFIG_DIR = 'config'
+TOKEN_PATH = os.path.join(CONFIG_DIR, 'token.json')
+LABEL_CACHE_PATH = os.path.join(CONFIG_DIR, 'label_cache.json')
+CREDENTIALS_PATH = os.path.join(CONFIG_DIR, 'credentials.json')
+IMAP_ACCOUNTS_PATH = os.path.join(CONFIG_DIR, 'imap_accounts.json')
+# --------------------
+
 label_cache = {}
 
 def load_label_cache():
     """Loads the label cache from a file if it exists."""
     global label_cache
-    if os.path.exists(LABEL_CACHE_FILE):
+    if os.path.exists(LABEL_CACHE_PATH):
         try:
-            with open(LABEL_CACHE_FILE, 'r') as f:
+            with open(LABEL_CACHE_PATH, 'r') as f:
                 label_cache = json.load(f)
         except (json.JSONDecodeError, FileNotFoundError):
-            print("Could not load label cache or file is corrupted. A new one will be created.")
+            print(f"Could not load label cache from {LABEL_CACHE_PATH}. A new one will be created.")
             label_cache = {}
 
 def save_label_cache():
     """Saves the current label cache to a file."""
-    with open(LABEL_CACHE_FILE, 'w') as f:
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(LABEL_CACHE_PATH, 'w') as f:
         json.dump(label_cache, f)
-# -------------------------
 
 def get_service():
     """Gets an authenticated Gmail service instance, reusing credentials if possible."""
     creds = None
-    if os.path.exists('token.json'):
-        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    if os.path.exists(TOKEN_PATH):
+        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                'credentials.json', SCOPES)
+            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
             creds = flow.run_local_server(port=0)
-        with open('token.json', 'w') as token:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(TOKEN_PATH, 'w') as token:
             token.write(creds.to_json())
     return build('gmail', 'v1', credentials=creds)
 
@@ -117,20 +124,20 @@ def main():
     load_label_cache()
     service = get_service()
     try:
-        with open("imap_accounts.json") as f:
+        with open(IMAP_ACCOUNTS_PATH) as f:
             all_accounts = json.load(f)
     except FileNotFoundError:
-        print("Error: imap_accounts.json not found.")
+        print(f"Error: {IMAP_ACCOUNTS_PATH} not found. Make sure the config directory is mounted correctly.")
         return
     except json.JSONDecodeError:
-        print("Error: Could not decode imap_accounts.json.")
+        print(f"Error: Could not decode {IMAP_ACCOUNTS_PATH}.")
         return
 
     accounts_to_process = all_accounts
     if args.only:
         accounts_to_process = [acc for acc in all_accounts if acc['username'] == args.only]
         if not accounts_to_process:
-            print(f"Error: Account '{args.only}' not found in imap_accounts.json.")
+            print(f"Error: Account '{args.only}' not found in {IMAP_ACCOUNTS_PATH}.")
             return
 
     for account in accounts_to_process:

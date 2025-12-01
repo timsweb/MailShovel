@@ -1,4 +1,4 @@
 google-api-python-client
 google-auth-oauthlib
 google-auth-httplib2
-imapclient
+imapclient>=3.0.0
