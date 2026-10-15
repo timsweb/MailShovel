@@ -72,10 +72,27 @@ class FakeGmail:
 
     def __init__(self, failures=None):
         self.imported = []
+        self.imported_labels = []
         self.failures = failures or {}  # substring of raw message -> HttpError
+        self.label_ids = {}
 
     def users(self):
         return self
+
+    def labels(self):
+        gmail = self
+        labels = mock.Mock()
+        labels.list.return_value.execute.side_effect = lambda: {
+            "labels": [{"name": n, "id": i} for n, i in gmail.label_ids.items()]}
+
+        def create(userId, body):
+            gmail.label_ids[body["name"]] = f"Label_{len(gmail.label_ids) + 1}"
+            request = mock.Mock()
+            request.execute.return_value = {"id": gmail.label_ids[body["name"]]}
+            return request
+
+        labels.create.side_effect = create
+        return labels
 
     def messages(self):
         return self
@@ -89,6 +106,7 @@ class FakeGmail:
                 if needle in msg:
                     raise err
             self.imported.append(msg)
+            self.imported_labels.append(body["labelIds"])
             return {"id": str(len(self.imported))}
 
         request.execute = execute
@@ -105,6 +123,12 @@ class FetchAndForwardTest(unittest.TestCase):
         patcher = mock.patch.object(shovel, "PENDING_SEEN_PATH", os.path.join(self.tmp.name, "pending.json"))
         patcher.start()
         self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(shovel, "LABEL_CACHE_PATH", os.path.join(self.tmp.name, "labels.json"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(shovel, "label_cache", {})
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.addCleanup(self.tmp.cleanup)
 
     def run_once(self, imap, gmail, pending):
@@ -119,15 +143,48 @@ class FetchAndForwardTest(unittest.TestCase):
 
     def test_permanent_rejection_is_flagged_and_rest_continue(self):
         imap = FakeIMAP({1: raw(1, "From: b@example.com\r\n"), 2: raw(2)})
-        gmail = FakeGmail({b"msg 1": http_error(400, "Expected a single 'From' header")})
+        gmail = FakeGmail({b"body 1": http_error(400, "Expected a single 'From' header")})
         self.run_once(imap, gmail, {})
         self.assertEqual(imap.flags[1], {shovel.imapclient.SEEN, shovel.imapclient.FLAGGED})
-        self.assertEqual(len(gmail.imported), 1)
         self.assertIn(shovel.imapclient.SEEN, imap.flags[2])
+        # The notice for message 1, then message 2 itself.
+        self.assertEqual(len(gmail.imported), 2)
+        self.assertIn(b"body 2", gmail.imported[1])
+
+    def test_rejection_leaves_notice_in_gmail(self):
+        imap = FakeIMAP({1: raw(1, "From: b@example.com\r\n")})
+        gmail = FakeGmail({b"body 1": http_error(400, "Expected a single 'From' header")})
+        account = dict(ACCOUNT, apply_labels=["acct"])
+        with mock.patch.object(shovel.imapclient, "IMAPClient", imap):
+            shovel.fetch_and_forward(account, gmail, {})
+
+        [notice], [labels] = gmail.imported, gmail.imported_labels
+        self.assertNotIn(b"body 1", notice)
+        text = notice.decode()
+        for expected in ("msg 1", "a@example.com", "Expected a single 'From' header", ACCOUNT["username"]):
+            self.assertIn(expected, text)
+        self.assertNotIn("INBOX", labels)
+        self.assertIn("UNREAD", labels)
+        self.assertIn(gmail.label_ids[shovel.REJECTED_LABEL], labels)
+        self.assertIn(gmail.label_ids["acct"], labels)
+
+    def test_original_stays_unseen_if_notice_fails(self):
+        imap = FakeIMAP({1: raw(1)})
+        gmail = FakeGmail({b"body 1": http_error(400, "Invalid attachment"),
+                           b"couldn't import": http_error(503, "Backend Error")})
+        with self.assertRaises(HttpError):
+            self.run_once(imap, gmail, {})
+        self.assertEqual(imap.flags[1], set())
+
+    def test_encoded_subject_is_decoded_in_notice(self):
+        imap = FakeIMAP({1: raw(1).replace(b"Subject: msg 1", b"Subject: =?UTF-8?B?U2hhcmUgWW91ciBGZWVkYmFjaw==?=")})
+        gmail = FakeGmail({b"body 1": http_error(400, "Invalid attachment")})
+        self.run_once(imap, gmail, {})
+        self.assertIn("Share Your Feedback", gmail.imported[0].decode())
 
     def test_label_400_is_not_treated_as_bad_message(self):
         imap = FakeIMAP({1: raw(1)})
-        gmail = FakeGmail({b"msg 1": http_error(400, "Invalid label: Label_123")})
+        gmail = FakeGmail({b"body 1": http_error(400, "Invalid label: Label_123")})
         with self.assertRaises(HttpError):
             self.run_once(imap, gmail, {})
         self.assertEqual(imap.flags[1], set())
@@ -135,14 +192,15 @@ class FetchAndForwardTest(unittest.TestCase):
     def test_too_many_rejections_stops(self):
         msgs = {u: raw(u) for u in range(1, 6)}
         imap = FakeIMAP(msgs)
-        gmail = FakeGmail({b"msg": http_error(400, "Invalid argument")})
+        gmail = FakeGmail({b"body": http_error(400, "Invalid argument")})
         with self.assertRaises(HttpError):
             self.run_once(imap, gmail, {})
         self.assertEqual(sum(1 for f in imap.flags.values() if f), shovel.MAX_REJECTIONS_PER_RUN)
+        self.assertEqual(len(gmail.imported), shovel.MAX_REJECTIONS_PER_RUN)
 
     def test_transient_failure_leaves_remaining_unseen(self):
         imap = FakeIMAP({1: raw(1), 2: raw(2), 3: raw(3)})
-        gmail = FakeGmail({b"msg 2": http_error(503, "Backend Error")})
+        gmail = FakeGmail({b"body 2": http_error(503, "Backend Error")})
         with self.assertRaises(HttpError):
             self.run_once(imap, gmail, {})
         self.assertIn(shovel.imapclient.SEEN, imap.flags[1])

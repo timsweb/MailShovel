@@ -5,7 +5,10 @@ import os
 import argparse
 import sys
 import time
+from email import policy
+from email.message import EmailMessage
 from email.parser import BytesHeaderParser
+from email.utils import formatdate, make_msgid
 from googleapiclient.errors import HttpError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -28,6 +31,8 @@ PENDING_SEEN_PATH = os.path.join(CONFIG_DIR, 'pending_seen.json')
 
 RETRY_DELAY = 10
 MAX_REJECTIONS_PER_RUN = 3
+# Gmail label for the notices left in place of messages Gmail refuses to import.
+REJECTED_LABEL = 'shovel/rejected'
 
 label_cache = {}
 
@@ -96,10 +101,10 @@ def get_or_create_label_ids(service, label_names):
         
     return label_ids
 
-def import_message(service, user_id, raw_message_bytes, label_ids):
+def import_message(service, user_id, raw_message_bytes, label_ids, inbox=True):
     """Imports a raw email message into Gmail and marks it as unread."""
     raw_b64 = base64.urlsafe_b64encode(raw_message_bytes).decode('utf-8')
-    final_label_ids = ['UNREAD', 'INBOX'] + label_ids
+    final_label_ids = ['UNREAD'] + (['INBOX'] if inbox else []) + label_ids
     message = {'raw': raw_b64, 'labelIds': final_label_ids}
     result = service.users().messages().import_(userId=user_id, body=message).execute()
     print(f"Imported message ID: {result['id']}")
@@ -141,10 +146,41 @@ def mark_pending_seen(client, username, uidvalidity, pending):
     pending[username] = []
     save_pending_seen(pending)
 
+def summary_headers(msg_bytes):
+    """Returns the From, Subject and Date of a raw message, decoded where possible."""
+    try:
+        headers = BytesHeaderParser(policy=policy.default).parsebytes(msg_bytes)
+        return {name: str(headers.get(name, '')) for name in ('From', 'Subject', 'Date')}
+    except Exception:
+        # Malformed headers: fall back to the raw values.
+        headers = BytesHeaderParser().parsebytes(msg_bytes)
+        return {name: str(headers.get(name, '')) for name in ('From', 'Subject', 'Date')}
+
 def describe(msg_bytes):
     """Returns a short From/Subject summary of a raw message for log lines."""
-    headers = BytesHeaderParser().parsebytes(msg_bytes)
-    return f"from={headers.get('From', '')!r} subject={headers.get('Subject', '')!r}"
+    headers = summary_headers(msg_bytes)
+    return f"from={headers['From']!r} subject={headers['Subject']!r}"
+
+def rejection_notice(username, uid, msg_bytes, reason):
+    """Builds a short email saying a message could not be imported, to import in its place."""
+    headers = summary_headers(msg_bytes)
+    notice = EmailMessage()
+    notice['From'] = f'MailShovel <{username}>'
+    notice['To'] = username
+    notice['Subject'] = f"[MailShovel] Couldn't import: {headers['Subject']}"
+    notice['Date'] = formatdate(localtime=True)
+    notice['Message-ID'] = make_msgid('mailshovel', domain=username.split('@')[-1])
+    notice.set_content(
+        f"MailShovel couldn't import a message from {username}, because Gmail rejected it.\n"
+        f"\n"
+        f"Reason:  {reason}\n"
+        f"From:    {headers['From']}\n"
+        f"Subject: {headers['Subject']}\n"
+        f"Date:    {headers['Date']}\n"
+        f"\n"
+        f"The original is still in the {username} IMAP inbox (UID {uid}), marked read and flagged.\n"
+    )
+    return notice.as_bytes()
 
 def fetch_and_forward(account, service, pending):
     """
@@ -191,10 +227,14 @@ def fetch_and_forward(account, service, pending):
                 if rejected > MAX_REJECTIONS_PER_RUN:
                     raise
                 # Gmail will never accept this message (e.g. duplicate From header,
-                # blocked attachment). Flag it on the IMAP side so it can be found,
-                # and move on rather than retrying it forever.
-                print(f"ERROR {username}: Gmail rejected message {uid}, flagged it in the IMAP inbox instead: "
-                      f"{e.reason} ({describe(msg_bytes)})")
+                # blocked attachment). Import a notice in its place, then flag the
+                # original on the IMAP side so it isn't retried forever. If the notice
+                # fails too, the original stays unseen for the next run.
+                notice_label_ids = get_or_create_label_ids(service, label_names + [REJECTED_LABEL])
+                import_message(service, 'me', rejection_notice(username, uid, msg_bytes, e.reason),
+                               notice_label_ids, inbox=False)
+                print(f"ERROR {username}: Gmail rejected message {uid}; left a notice under "
+                      f"'{REJECTED_LABEL}' and flagged the original: {e.reason} ({describe(msg_bytes)})")
                 client.add_flags([uid], [imapclient.SEEN, imapclient.FLAGGED])
                 continue
 
