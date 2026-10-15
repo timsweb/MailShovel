@@ -3,6 +3,10 @@ import imapclient
 import base64
 import os
 import argparse
+import sys
+import time
+from email.parser import BytesHeaderParser
+from googleapiclient.errors import HttpError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -18,7 +22,12 @@ TOKEN_PATH = os.path.join(CONFIG_DIR, 'token.json')
 LABEL_CACHE_PATH = os.path.join(CONFIG_DIR, 'label_cache.json')
 CREDENTIALS_PATH = os.path.join(CONFIG_DIR, 'credentials.json')
 IMAP_ACCOUNTS_PATH = os.path.join(CONFIG_DIR, 'imap_accounts.json')
+# Messages imported into Gmail whose IMAP \Seen flag could not be set.
+PENDING_SEEN_PATH = os.path.join(CONFIG_DIR, 'pending_seen.json')
 # --------------------
+
+RETRY_DELAY = 10
+MAX_REJECTIONS_PER_RUN = 3
 
 label_cache = {}
 
@@ -95,14 +104,66 @@ def import_message(service, user_id, raw_message_bytes, label_ids):
     result = service.users().messages().import_(userId=user_id, body=message).execute()
     print(f"Imported message ID: {result['id']}")
 
-def fetch_and_forward(account, service):
-    """Fetches unseen emails from an IMAP account and forwards them to Gmail."""
+def load_pending_seen():
+    """Loads messages that were imported but could not be marked as seen."""
+    if os.path.exists(PENDING_SEEN_PATH):
+        try:
+            with open(PENDING_SEEN_PATH, 'r') as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            print(f"Could not read {PENDING_SEEN_PATH}; ignoring it.")
+    return {}
+
+def save_pending_seen(pending):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(PENDING_SEEN_PATH, 'w') as f:
+        json.dump(pending, f)
+
+def mark_pending_seen(client, username, uidvalidity, pending):
+    """
+    Marks as seen any messages that a previous attempt imported but failed to flag,
+    so they are not imported a second time. Matches by UID while UIDVALIDITY is
+    unchanged, otherwise by Message-ID.
+    """
+    entries = pending.get(username, [])
+    if not entries:
+        return
+    for entry in entries:
+        if entry["uidvalidity"] == uidvalidity:
+            uids = [entry["uid"]]
+        elif entry.get("message_id"):
+            uids = client.search(["HEADER", "Message-ID", entry["message_id"]])
+        else:
+            uids = []
+        if uids:
+            client.add_flags(uids, [imapclient.SEEN])
+        print(f"{username}: marked previously imported message {entry['uid']} as seen.")
+    pending[username] = []
+    save_pending_seen(pending)
+
+def describe(msg_bytes):
+    """Returns a short From/Subject summary of a raw message for log lines."""
+    headers = BytesHeaderParser().parsebytes(msg_bytes)
+    return f"from={headers.get('From', '')!r} subject={headers.get('Subject', '')!r}"
+
+def fetch_and_forward(account, service, pending):
+    """
+    Fetches unseen emails from an IMAP account and imports them into Gmail.
+
+    Messages are fetched with BODY.PEEK[] so the server does not mark them as read;
+    each one is marked as seen only after Gmail has accepted it. A failure part-way
+    through therefore leaves the remaining messages unseen for the next attempt.
+    """
+    username = account["username"]
     with imapclient.IMAPClient(account["imap_host"], port=account["imap_port"], ssl=True) as client:
-        client.login(account["username"], account["password"])
-        client.select_folder("INBOX")
-        
+        client.login(username, account["password"])
+        folder_info = client.select_folder("INBOX")
+        uidvalidity = folder_info[b"UIDVALIDITY"]
+
+        mark_pending_seen(client, username, uidvalidity, pending)
+
         unseen_messages = client.search(["UNSEEN"])
-        print(f"{account['username']}: found {len(unseen_messages)} unseen messages.")
+        print(f"{username}: found {len(unseen_messages)} unseen messages.")
 
         if not unseen_messages:
             return
@@ -110,10 +171,54 @@ def fetch_and_forward(account, service):
         label_names = account.get("apply_labels", [])
         label_ids = get_or_create_label_ids(service, label_names) if label_names else []
 
-        for msgid, data in client.fetch(unseen_messages, ["RFC822"]).items():
-            msg_bytes = data[b"RFC822"]
-            import_message(service, 'me', msg_bytes, label_ids)
-            client.set_flags(msgid, [imapclient.SEEN])
+        rejected = 0
+        for uid in unseen_messages:
+            data = client.fetch([uid], ["BODY.PEEK[]"]).get(uid)
+            if data is None:
+                # Expunged since the search.
+                continue
+            msg_bytes = data[b"BODY[]"]
+
+            try:
+                import_message(service, 'me', msg_bytes, label_ids)
+            except HttpError as e:
+                # A 400 about labels is a problem with the request, not the message.
+                if e.resp.status != 400 or "label" in str(e.reason).lower():
+                    raise
+                # Several rejections in one run suggest the request is at fault
+                # rather than the messages, so stop instead of flagging everything.
+                rejected += 1
+                if rejected > MAX_REJECTIONS_PER_RUN:
+                    raise
+                # Gmail will never accept this message (e.g. duplicate From header,
+                # blocked attachment). Flag it on the IMAP side so it can be found,
+                # and move on rather than retrying it forever.
+                print(f"ERROR {username}: Gmail rejected message {uid}, flagged it in the IMAP inbox instead: "
+                      f"{e.reason} ({describe(msg_bytes)})")
+                client.add_flags([uid], [imapclient.SEEN, imapclient.FLAGGED])
+                continue
+
+            try:
+                client.add_flags([uid], [imapclient.SEEN])
+            except Exception:
+                message_id = BytesHeaderParser().parsebytes(msg_bytes).get("Message-ID")
+                pending.setdefault(username, []).append(
+                    {"uidvalidity": uidvalidity, "uid": uid, "message_id": message_id})
+                save_pending_seen(pending)
+                raise
+
+def with_retry(description, func):
+    """
+    Runs func, retrying once after RETRY_DELAY seconds. The first failure is
+    logged without the words the Grafana "Recent errors" panel matches on, since
+    DreamHost routinely drops sessions and the retry nearly always succeeds.
+    """
+    try:
+        return func()
+    except Exception as e:
+        print(f"{description}: first attempt failed ({e}); retrying in {RETRY_DELAY}s.")
+        time.sleep(RETRY_DELAY)
+        return func()
 
 def main():
     """Main function to run the email forwarding process."""
@@ -122,7 +227,11 @@ def main():
     args = parser.parse_args()
 
     load_label_cache()
-    service = get_service()
+    try:
+        service = with_retry("Gmail authentication", get_service)
+    except Exception as e:
+        print(f"ERROR: could not authenticate with Gmail: {e}")
+        sys.exit(1)
     try:
         with open(IMAP_ACCOUNTS_PATH) as f:
             all_accounts = json.load(f)
@@ -140,9 +249,10 @@ def main():
             print(f"Error: Account '{args.only}' not found in {IMAP_ACCOUNTS_PATH}.")
             return
 
+    pending = load_pending_seen()
     for account in accounts_to_process:
         try:
-            fetch_and_forward(account, service)
+            with_retry(account['username'], lambda: fetch_and_forward(account, service, pending))
             print(f"Completed fetching and forwarding for {account['username']}.")
         except Exception as e:
             print(f"An error occurred with {account['username']}: {e}")
