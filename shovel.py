@@ -101,12 +101,13 @@ def get_or_create_label_ids(service, label_names):
         
     return label_ids
 
-def import_message(service, user_id, raw_message_bytes, label_ids, inbox=True):
+def import_message(service, user_id, raw_message_bytes, label_ids, inbox=True, never_spam=False):
     """Imports a raw email message into Gmail and marks it as unread."""
     raw_b64 = base64.urlsafe_b64encode(raw_message_bytes).decode('utf-8')
     final_label_ids = ['UNREAD'] + (['INBOX'] if inbox else []) + label_ids
     message = {'raw': raw_b64, 'labelIds': final_label_ids}
-    result = service.users().messages().import_(userId=user_id, body=message).execute()
+    options = {'neverMarkSpam': True} if never_spam else {}
+    result = service.users().messages().import_(userId=user_id, body=message, **options).execute()
     print(f"Imported message ID: {result['id']}")
 
 def load_pending_seen():
@@ -165,7 +166,8 @@ def rejection_notice(username, uid, msg_bytes, reason):
     """Builds a short email saying a message could not be imported, to import in its place."""
     headers = summary_headers(msg_bytes)
     notice = EmailMessage()
-    notice['From'] = f'MailShovel <{username}>'
+    # Not the account's own address: Gmail files mail from a send-as address under Sent.
+    notice['From'] = f"MailShovel <mailshovel@{username.split('@')[-1]}>"
     notice['To'] = username
     notice['Subject'] = f"[MailShovel] Couldn't import: {headers['Subject']}"
     notice['Date'] = formatdate(localtime=True)
@@ -232,7 +234,7 @@ def fetch_and_forward(account, service, pending):
                 # fails too, the original stays unseen for the next run.
                 notice_label_ids = get_or_create_label_ids(service, label_names + [REJECTED_LABEL])
                 import_message(service, 'me', rejection_notice(username, uid, msg_bytes, e.reason),
-                               notice_label_ids, inbox=False)
+                               notice_label_ids, inbox=False, never_spam=True)
                 print(f"ERROR {username}: Gmail rejected message {uid}; left a notice under "
                       f"'{REJECTED_LABEL}' and flagged the original: {e.reason} ({describe(msg_bytes)})")
                 client.add_flags([uid], [imapclient.SEEN, imapclient.FLAGGED])

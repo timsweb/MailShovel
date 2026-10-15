@@ -73,6 +73,7 @@ class FakeGmail:
     def __init__(self, failures=None):
         self.imported = []
         self.imported_labels = []
+        self.import_kwargs = []
         self.failures = failures or {}  # substring of raw message -> HttpError
         self.label_ids = {}
 
@@ -97,7 +98,7 @@ class FakeGmail:
     def messages(self):
         return self
 
-    def import_(self, userId, body):
+    def import_(self, userId, body, **kwargs):
         msg = base64.urlsafe_b64decode(body["raw"])
         request = mock.Mock()
 
@@ -107,6 +108,7 @@ class FakeGmail:
                     raise err
             self.imported.append(msg)
             self.imported_labels.append(body["labelIds"])
+            self.import_kwargs.append(kwargs)
             return {"id": str(len(self.imported))}
 
         request.execute = execute
@@ -167,6 +169,10 @@ class FetchAndForwardTest(unittest.TestCase):
         self.assertIn("UNREAD", labels)
         self.assertIn(gmail.label_ids[shovel.REJECTED_LABEL], labels)
         self.assertIn(gmail.label_ids["acct"], labels)
+        # Gmail's spam filter would otherwise bin notices about spam.
+        self.assertEqual(gmail.import_kwargs, [{"neverMarkSpam": True}])
+        # Not from the account itself, which Gmail may know as a send-as address and file under Sent.
+        self.assertIn("From: MailShovel <mailshovel@example.com>", text)
 
     def test_original_stays_unseen_if_notice_fails(self):
         imap = FakeIMAP({1: raw(1)})
